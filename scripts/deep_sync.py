@@ -30,21 +30,24 @@ def call_gateway(tool, action, params):
     if "profile" in params:
         cmd.extend(["--browser-profile", params["profile"]])
     
+    # --json is a global flag that must come BEFORE the subcommand
+    cmd.append("--json")
+
     if action == "open":
-        cmd.extend(["open", "--json", params["targetUrl"]])
+        cmd.extend(["open", params["targetUrl"]])
     elif action == "snapshot":
-        cmd.extend(["snapshot", "--json"])
+        cmd.append("snapshot")
         if "targetId" in params:
             cmd.extend(["--target-id", params["targetId"]])
     elif action == "act":
-        cmd.extend(["act", "--json"])
+        cmd.append("act")
         req = {}
         if "kind" in params: req["kind"] = params["kind"]
         if "targetId" in params: req["targetId"] = params["targetId"]
         if "fn" in params: req["fn"] = params["fn"]
         cmd.append(json.dumps(req))
     elif action == "close":
-        cmd.extend(["close", "--json"])
+        cmd.append("close")
         if "targetId" in params:
             cmd.append(params["targetId"])
     else:
