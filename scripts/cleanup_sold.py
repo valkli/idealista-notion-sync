@@ -17,14 +17,15 @@ def call_gateway(tool, action, params):
     cmd = ["openclaw.cmd", "browser"]
     if "profile" in params:
         cmd.extend(["--browser-profile", params["profile"]])
+    cmd.append("--json")
     if action == "open":
-        cmd.extend(["open", "--json", params["targetUrl"]])
+        cmd.extend(["open", params["targetUrl"]])
     elif action == "snapshot":
-        cmd.extend(["snapshot", "--json"])
+        cmd.extend(["snapshot"])
         if "targetId" in params:
             cmd.extend(["--target-id", params["targetId"]])
     elif action == "close":
-        cmd.extend(["close", "--json"])
+        cmd.extend(["close"])
         if "targetId" in params:
             cmd.append(params["targetId"])
     else:
