@@ -19,6 +19,11 @@ import subprocess
 import requests
 from datetime import datetime
 
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:
+    sync_playwright = None
+
 sys.stdout.reconfigure(encoding='utf-8')
 
 # --- CONFIG ---
@@ -168,11 +173,10 @@ def call_browser(action, params):
         return None
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=90)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=45)
         if result.returncode != 0:
-            print(f"  ⚠ Browser error: {result.stderr[:200]}")
+            print(f"  [BrowserCLI] Error: {result.stderr[:200]}")
             return None
-        # Find JSON in output
         lines = result.stdout.strip().split('\n')
         json_lines = []
         capturing = False
@@ -185,8 +189,43 @@ def call_browser(action, params):
             return json.loads('\n'.join(json_lines))
         return json.loads(result.stdout)
     except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
-        print(f"  ⚠ Browser call error: {e}")
+        print(f"  [BrowserCLI] Call error: {e}")
         return None
+
+
+def scrape_agency_with_playwright(agency_url):
+    if sync_playwright is None:
+        print("[Playwright] Not available")
+        return None
+
+    cdp_url = "http://127.0.0.1:18800"
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(cdp_url)
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.new_page()
+        try:
+            page.goto(agency_url, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(5000)
+            html = page.content()
+            urls = []
+            seen = set()
+            for match in re.finditer(r'https://www\\.idealista\\.com(?:/ru)?/pro/.+?/inmueble/(\\d+)/', html):
+                prop_id = match.group(1)
+                full = match.group(0)
+                if prop_id not in seen:
+                    urls.append({"id": prop_id, "url": full})
+                    seen.add(prop_id)
+            if not urls:
+                for match in re.finditer(r'href="((?:/ru)?/pro/.+?/inmueble/(\\d+)/)"', html):
+                    rel = match.group(1)
+                    prop_id = match.group(2)
+                    full = f"https://www.idealista.com{rel}"
+                    if prop_id not in seen:
+                        urls.append({"id": prop_id, "url": full})
+                        seen.add(prop_id)
+            return {"urls": urls, "html": html}
+        finally:
+            page.close()
 
 
 def extract_property_data(target_id):
@@ -199,8 +238,7 @@ def extract_property_data(target_id):
     })
     if not res:
         return {}
-    
-    # Result may be in res["result"] or res["value"]
+
     raw = res.get("result") or res.get("value") or res.get("output") or ""
     if isinstance(raw, dict):
         return raw
@@ -209,12 +247,36 @@ def extract_property_data(target_id):
             return json.loads(raw)
         except:
             pass
-    
-    # Fallback: try snapshot-based parsing
+
     snap_res = call_browser("snapshot", {"targetId": target_id, "profile": "openclaw"})
     if snap_res and "snapshot" in snap_res:
         return parse_snapshot_fallback(snap_res["snapshot"])
     return {}
+
+
+def extract_property_data_playwright(property_url):
+    if sync_playwright is None:
+        return {}
+
+    cdp_url = "http://127.0.0.1:18800"
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(cdp_url)
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.new_page()
+        try:
+            page.goto(property_url, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(4000)
+            raw = page.evaluate(EXTRACTOR_JS)
+            if isinstance(raw, str):
+                data = json.loads(raw)
+            elif isinstance(raw, dict):
+                data = raw
+            else:
+                data = {}
+            data["url"] = property_url
+            return data
+        finally:
+            page.close()
 
 
 def parse_snapshot_fallback(snap):
@@ -481,101 +543,89 @@ def update_notion_page(page_id, data):
 
 def get_property_urls_from_agency(main_target_id):
     """Get all property URLs from agency listing page."""
-    print("  📸 Taking agency snapshot...")
+    print("  [Agency] Taking snapshot...")
     snap_res = call_browser("snapshot", {"targetId": main_target_id, "profile": "openclaw"})
     if not snap_res or "snapshot" not in snap_res:
         return []
-    
+
     snap = snap_res["snapshot"]
-    matches = re.findall(r'/url:\s+(/(?:ru/)?pro/.+?/inmueble/(\d+)/)', snap)
-    
+    patterns = [
+        r'/url:\s+(/(?:ru/)?pro/.+?/inmueble/(\d+)/)',
+        r'(https://www\.idealista\.com/(?:ru/)?pro/.+?/inmueble/(\d+)/)',
+        r'((?:/|https://www\.idealista\.com/)(?:ru/)?inmueble/(\d+)/)'
+    ]
+
     unique = []
     seen_ids = set()
-    for full_path, prop_id in matches:
-        if prop_id not in seen_ids:
-            unique.append({
-                "url": f"https://www.idealista.com{full_path}",
-                "id": prop_id
-            })
+    for pattern in patterns:
+        for full_path, prop_id in re.findall(pattern, snap):
+            if prop_id in seen_ids:
+                continue
+            url = full_path if full_path.startswith('http') else f"https://www.idealista.com{full_path}"
+            unique.append({"url": url, "id": prop_id})
             seen_ids.add(prop_id)
-    
-    print(f"  🏠 Found {len(unique)} property URLs on agency page")
+
+    print(f"  [Agency] Found {len(unique)} property URLs on agency page")
     return unique
 
 
 def process_agency(agency_url):
     """Sync new properties from an Idealista agency page."""
     print(f"\n{'='*60}")
-    print(f"🏢 Syncing agency: {agency_url}")
+    print(f"[Agency] Syncing: {agency_url}")
     print(f"{'='*60}")
-    
+
     existing_urls = get_existing_urls()
-    print(f"📊 Notion has {len(existing_urls)} existing properties")
+    print(f"[Notion] Existing properties: {len(existing_urls)}")
+
+    stats = {"added": 0, "skipped": 0, "errors": 0, "fatal": False, "fatal_reason": ""}
+
+    agency_data = scrape_agency_with_playwright(agency_url)
+    if not agency_data:
+        print("[Error] Failed to scrape agency page via Playwright/CDP")
+        return {"added": 0, "skipped": 0, "errors": 1, "fatal": True, "fatal_reason": "failed_to_scrape_agency_page"}
+
+    prop_urls = agency_data.get("urls", [])
+    new_props = [p for p in prop_urls if p["url"] not in existing_urls]
+    print(f"  [Agency] New properties to add: {len(new_props)} (skipping {len(prop_urls) - len(new_props)} existing)")
+
+    for i, prop in enumerate(new_props, 1):
+        print(f"\n  [{i}/{len(new_props)}] {prop['url']}")
+        try:
+            data = extract_property_data_playwright(prop["url"])
+        except Exception as e:
+            print(f"    [Error] Playwright property scrape failed: {e}")
+            stats["errors"] += 1
+            continue
+
+        if not data.get("title"):
+            data["title"] = f"Propiedad {prop['id']}"
+        data["url"] = prop["url"]
+
+        if add_to_notion(data):
+            stats["added"] += 1
+        else:
+            stats["errors"] += 1
+
+        time.sleep(random.uniform(2, 5))
+
+    stats["skipped"] = len(prop_urls) - len(new_props)
     
-    # Open agency page
-    res_open = call_browser("open", {"targetUrl": agency_url, "profile": "openclaw"})
-    if not res_open or "targetId" not in res_open:
-        print("❌ Failed to open agency page")
-        return {"added": 0, "skipped": 0, "errors": 0}
-    
-    main_tid = res_open["targetId"]
-    time.sleep(5)
-    
-    stats = {"added": 0, "skipped": 0, "errors": 0}
-    
-    try:
-        prop_urls = get_property_urls_from_agency(main_tid)
-        new_props = [p for p in prop_urls if p["url"] not in existing_urls]
-        print(f"  ✨ New properties to add: {len(new_props)} (skipping {len(prop_urls) - len(new_props)} existing)")
-        
-        for i, prop in enumerate(new_props, 1):
-            print(f"\n  [{i}/{len(new_props)}] {prop['url']}")
-            
-            res_prop = call_browser("open", {"targetUrl": prop["url"], "profile": "openclaw"})
-            if not res_prop or "targetId" not in res_prop:
-                print("    ⚠ Failed to open property page")
-                stats["errors"] += 1
-                continue
-            
-            prop_tid = res_prop["targetId"]
-            time.sleep(random.uniform(3, 6))
-            
-            # Extract all data via JavaScript
-            data = extract_property_data(prop_tid)
-            data["url"] = prop["url"]
-            
-            # Ensure we have at least the title
-            if not data.get("title"):
-                data["title"] = f"Propiedad {prop['id']}"
-            
-            if add_to_notion(data):
-                stats["added"] += 1
-            else:
-                stats["errors"] += 1
-            
-            call_browser("close", {"targetId": prop_tid})
-            time.sleep(random.uniform(8, 15))
-        
-        stats["skipped"] = len(prop_urls) - len(new_props)
-    
-    finally:
-        call_browser("close", {"targetId": main_tid})
-    
-    print(f"\n📊 Agency sync done: +{stats['added']} added, {stats['skipped']} skipped, {stats['errors']} errors")
+    print(f"\n[Summary] Agency sync done: +{stats['added']} added, {stats['skipped']} skipped, {stats['errors']} errors")
     return stats
 
 
 def fill_empty_pages(limit=30):
     """Find and fill pages that are missing key data."""
     print(f"\n{'='*60}")
-    print(f"🔍 Looking for empty pages in Notion...")
+    print(f"[FillEmpty] Looking for empty pages in Notion...")
     print(f"{'='*60}")
     
     empty = get_empty_pages(limit)
-    print(f"📋 Found {len(empty)} pages with incomplete data")
-    
+    print(f"[FillEmpty] Found {len(empty)} pages with incomplete data")
+
     if not empty:
-        print("✅ All pages have data!")
+        print("[FillEmpty] All pages have data")
         return {"filled": 0, "errors": 0}
     
     stats = {"filled": 0, "errors": 0}
@@ -637,14 +687,18 @@ if __name__ == "__main__":
         print("  python deep_sync_v2.py <agency_url> --fill-empty")
         sys.exit(1)
     
-    total_stats = {"added": 0, "skipped": 0, "errors": 0, "filled": 0}
+    total_stats = {"added": 0, "skipped": 0, "errors": 0, "filled": 0, "ok": True, "fatal": False, "fatal_reason": ""}
     
     if agency_url:
         s = process_agency(agency_url)
         total_stats["added"] += s["added"]
         total_stats["skipped"] += s["skipped"]
         total_stats["errors"] += s["errors"]
-    
+        if s.get("fatal"):
+            total_stats["ok"] = False
+            total_stats["fatal"] = True
+            total_stats["fatal_reason"] = s.get("fatal_reason", "agency_sync_failed")
+
     if do_fill_empty:
         s = fill_empty_pages(limit=30)
         total_stats["filled"] = s["filled"]
