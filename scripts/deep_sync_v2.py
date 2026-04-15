@@ -24,6 +24,10 @@ try:
 except Exception:
     sync_playwright = None
 
+CHROMIUM_EXE = r"C:\Users\Val\AppData\Local\ms-playwright\chromium-1208\chrome-win64\chrome.exe"
+CDP_URL = "http://127.0.0.1:18800"
+BROWSER_PROFILE_DIR = r"C:\Users\Val\.openclaw\browser\openclaw"
+
 sys.stdout.reconfigure(encoding='utf-8')
 
 # --- CONFIG ---
@@ -193,14 +197,42 @@ def call_browser(action, params):
         return None
 
 
+def connect_browser_with_auto_start(playwright_instance):
+    try:
+        return playwright_instance.chromium.connect_over_cdp(CDP_URL)
+    except Exception as first_error:
+        print(f"[Playwright] CDP not available, starting browser: {first_error}")
+        if not os.path.exists(CHROMIUM_EXE):
+            raise RuntimeError(f"Chromium not found: {CHROMIUM_EXE}") from first_error
+        if not os.path.exists(BROWSER_PROFILE_DIR):
+            raise RuntimeError(f"Browser profile not found: {BROWSER_PROFILE_DIR}") from first_error
+
+        subprocess.Popen([
+            CHROMIUM_EXE,
+            f"--user-data-dir={BROWSER_PROFILE_DIR}",
+            "--remote-debugging-port=18800",
+            "--no-first-run",
+            "about:blank"
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        deadline = time.time() + 25
+        last_error = first_error
+        while time.time() < deadline:
+            try:
+                time.sleep(1)
+                return playwright_instance.chromium.connect_over_cdp(CDP_URL)
+            except Exception as e:
+                last_error = e
+        raise RuntimeError(f"Failed to connect to CDP after browser autostart: {last_error}") from last_error
+
+
 def scrape_agency_with_playwright(agency_url):
     if sync_playwright is None:
         print("[Playwright] Not available")
         return None
 
-    cdp_url = "http://127.0.0.1:18800"
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(cdp_url)
+        browser = connect_browser_with_auto_start(p)
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
         try:
@@ -209,20 +241,44 @@ def scrape_agency_with_playwright(agency_url):
             html = page.content()
             urls = []
             seen = set()
-            for match in re.finditer(r'https://www\\.idealista\\.com(?:/ru)?/pro/.+?/inmueble/(\\d+)/', html):
-                prop_id = match.group(1)
-                full = match.group(0)
-                if prop_id not in seen:
-                    urls.append({"id": prop_id, "url": full})
-                    seen.add(prop_id)
+
+            hrefs = page.eval_on_selector_all(
+                "a.item-link[href], a[href*='inmueble']",
+                "elements => elements.map(a => a.getAttribute('href') || '').filter(Boolean)"
+            )
+            for href in hrefs:
+                href = href.strip()
+                m = re.search(r'/inmueble/(\d+)/', href)
+                if not m:
+                    continue
+                prop_id = m.group(1)
+                if prop_id in seen:
+                    continue
+                full = href if href.startswith('http') else f"https://www.idealista.com{href}"
+                urls.append({"id": prop_id, "url": full})
+                seen.add(prop_id)
+
+            safe_hrefs_preview = [h.encode('ascii', 'ignore').decode() for h in hrefs[:5]]
+            print(f"  [Agency] DOM href candidates: {len(hrefs)}, parsed property URLs: {len(urls)}")
+            if safe_hrefs_preview:
+                print(f"  [Agency] Sample hrefs: {safe_hrefs_preview}")
+
             if not urls:
-                for match in re.finditer(r'href="((?:/ru)?/pro/.+?/inmueble/(\\d+)/)"', html):
-                    rel = match.group(1)
-                    prop_id = match.group(2)
-                    full = f"https://www.idealista.com{rel}"
+                for match in re.finditer(r'https://www\\.idealista\\.com(?:/ru)?/pro/.+?/inmueble/(\d+)/', html):
+                    prop_id = match.group(1)
+                    full = match.group(0)
                     if prop_id not in seen:
                         urls.append({"id": prop_id, "url": full})
                         seen.add(prop_id)
+
+            if not urls:
+                for match in re.finditer(r'/pro/[^\"\']+/inmueble/(\d+)/', html):
+                    prop_id = match.group(1)
+                    rel = match.group(0)
+                    if prop_id not in seen:
+                        urls.append({"id": prop_id, "url": f"https://www.idealista.com{rel}"})
+                        seen.add(prop_id)
+
             return {"urls": urls, "html": html}
         finally:
             page.close()
@@ -258,9 +314,8 @@ def extract_property_data_playwright(property_url):
     if sync_playwright is None:
         return {}
 
-    cdp_url = "http://127.0.0.1:18800"
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(cdp_url)
+        browser = connect_browser_with_auto_start(p)
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
         try:
