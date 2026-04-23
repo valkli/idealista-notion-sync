@@ -207,13 +207,18 @@ def connect_browser_with_auto_start(playwright_instance):
         if not os.path.exists(BROWSER_PROFILE_DIR):
             raise RuntimeError(f"Browser profile not found: {BROWSER_PROFILE_DIR}") from first_error
 
-        subprocess.Popen([
+        user_data_dir = os.path.dirname(BROWSER_PROFILE_DIR)
+        profile_name = os.path.basename(BROWSER_PROFILE_DIR)
+        launch_args = [
             CHROMIUM_EXE,
-            f"--user-data-dir={BROWSER_PROFILE_DIR}",
+            f"--user-data-dir={user_data_dir}",
+            f"--profile-directory={profile_name}",
             "--remote-debugging-port=18800",
             "--no-first-run",
             "about:blank"
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ]
+
+        subprocess.Popen(launch_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         deadline = time.time() + 25
         last_error = first_error
