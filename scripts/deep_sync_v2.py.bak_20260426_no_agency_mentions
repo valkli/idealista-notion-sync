@@ -85,34 +85,6 @@ AUTO_TRANSLATE_NOISE = [
 ]
 
 
-AGENCY_NOISE_PATTERNS = [
-    r"\bK\s*&\s*N\s*Elite\b",
-    r"\bK\s*and\s*N\s*Elite\b",
-    r"\bK&N\s+Elite\s+Real\s+Estate\b",
-    r"\bK\s*N\s*Elite\b",
-    r"\bSfero\s+Real\s+Estate\b",
-    r"\bInmobiliaria\s+Lux\s+Cullera\b",
-    r"\bBest\s+Broker\s+Real\b",
-]
-
-
-def strip_agency_mentions(text):
-    """Remove source-agency branding. Objects are sold by i-Club, not by scraped agencies."""
-    text = text or ""
-    agency_re = "|".join(f"(?:{p})" for p in AGENCY_NOISE_PATTERNS)
-    # Remove whole lines/sentences that contain an agency name.
-    chunks = re.split(r"(?<=[.!?。])\s+|\n+", text)
-    kept = []
-    for chunk in chunks:
-        if re.search(agency_re, chunk, flags=re.I):
-            continue
-        kept.append(chunk)
-    text = "\n\n".join(c.strip() for c in kept if c.strip())
-    # Safety pass if a mention survived inside a longer fragment.
-    text = re.sub(agency_re, "i-Club", text, flags=re.I)
-    return text.strip()
-
-
 def extract_idealista_id(url_or_text):
     if not url_or_text:
         return None
@@ -129,7 +101,7 @@ def normalize_idealista_url(url):
 
 
 def clean_description_text(text):
-    text = strip_agency_mentions((text or "").replace("\xa0", " "))
+    text = (text or "").replace("\xa0", " ")
     for bad in AUTO_TRANSLATE_NOISE:
         text = text.replace(bad, " ")
     # Drop common agency/legal disclaimers and UI fragments.
@@ -757,6 +729,7 @@ def build_notion_children(data):
     if data.get("year_built"): char_lines.append(f"📅 Год: {data['year_built']}")
     if data.get("condition"): char_lines.append(f"🔧 Состояние: {data['condition']}")
     if data.get("tipo"): char_lines.append(f"🏠 Тип: {data['tipo']}")
+    if data.get("agency"): char_lines.append(f"🏢 Агентство: {data['agency']}")
     if data.get("coords"): char_lines.append(f"📍 Координаты: {data['coords']}")
 
     if char_lines:

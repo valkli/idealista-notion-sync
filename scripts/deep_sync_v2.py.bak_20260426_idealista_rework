@@ -41,283 +41,110 @@ NOTION_HEADERS = {
     "Content-Type": "application/json"
 }
 
-# --- Constants / mapping ---
-CONTACT_EMAIL = "www.realestatespain.net@gmail.com"
-CONTACT_PHONE = "+34744728273"
-DEFAULT_COMMISSION = 0.05
-DEFAULT_OUR_COMMISSION = 0.50
-
-TYPE_OPTIONS = {
-    "piso": "Piso",
-    "apartamento": "Piso",
-    "ático": "Piso",
-    "atico": "Piso",
-    "estudio": "Piso",
-    "chalet": "Single-Family Home",
-    "villa": "Single-Family Home",
-    "casa": "Single-Family Home",
-    "adosado": "Таунхаус",
-    "pareado": "Таунхаус",
-    "townhouse": "Townhouse",
-}
-
-AMENITY_MAP = {
-    "pool": "Бассейн",
-    "private_pool": "Частный бассейн",
-    "garage": "Гараж",
-    "parking": "Парковка",
-    "terrace": "Терраса",
-    "garden": "Задний двор",
-    "fireplace": "Камин",
-    "gym": "Тренажерный зал",
-    "ocean_view": "Вид на океан",
-    "bbq": "Зона для барбекю",
-    "elevator": "Лифт",
-    "ac": "Кондиционер",
-    "heating": "Отопление",
-}
-
-AUTO_TRANSLATE_NOISE = [
-    "Этот адрес был переведен автоматически, возможно, он не точен.",
-    "Посмотреть описание на языке оригинала",
-    "Ver descripción en idioma original",
-    "This address was translated automatically",
-]
-
-
-AGENCY_NOISE_PATTERNS = [
-    r"\bK\s*&\s*N\s*Elite\b",
-    r"\bK\s*and\s*N\s*Elite\b",
-    r"\bK&N\s+Elite\s+Real\s+Estate\b",
-    r"\bK\s*N\s*Elite\b",
-    r"\bSfero\s+Real\s+Estate\b",
-    r"\bInmobiliaria\s+Lux\s+Cullera\b",
-    r"\bBest\s+Broker\s+Real\b",
-]
-
-
-def strip_agency_mentions(text):
-    """Remove source-agency branding. Objects are sold by i-Club, not by scraped agencies."""
-    text = text or ""
-    agency_re = "|".join(f"(?:{p})" for p in AGENCY_NOISE_PATTERNS)
-    # Remove whole lines/sentences that contain an agency name.
-    chunks = re.split(r"(?<=[.!?。])\s+|\n+", text)
-    kept = []
-    for chunk in chunks:
-        if re.search(agency_re, chunk, flags=re.I):
-            continue
-        kept.append(chunk)
-    text = "\n\n".join(c.strip() for c in kept if c.strip())
-    # Safety pass if a mention survived inside a longer fragment.
-    text = re.sub(agency_re, "i-Club", text, flags=re.I)
-    return text.strip()
-
-
-def extract_idealista_id(url_or_text):
-    if not url_or_text:
-        return None
-    m = re.search(r"/inmueble/(\d+)/", str(url_or_text))
-    if m:
-        return int(m.group(1))
-    m = re.search(r"idealista\.com/.+?(\d{6,})", str(url_or_text))
-    return int(m.group(1)) if m else None
-
-
-def normalize_idealista_url(url):
-    prop_id = extract_idealista_id(url)
-    return f"https://www.idealista.com/inmueble/{prop_id}/" if prop_id else (url or "")
-
-
-def clean_description_text(text):
-    text = strip_agency_mentions((text or "").replace("\xa0", " "))
-    for bad in AUTO_TRANSLATE_NOISE:
-        text = text.replace(bad, " ")
-    # Drop common agency/legal disclaimers and UI fragments.
-    stop_patterns = [
-        r"Настоящее предложение разработано.*$",
-        r"Вся информация.*?договорную силу\.?",
-        r"Несмотря на то.*$",
-        r"SFERO рекомендует.*$",
-        r"Este anuncio.*$",
-        r"La información.*?contractual\.?",
-    ]
-    for pat in stop_patterns:
-        text = re.sub(pat, "", text, flags=re.I | re.S)
-    text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"([А-ЯЁ]{4,})([А-ЯЁ][а-яё])", r"\1\n\n\2", text)
-    text = re.sub(r"([а-яёa-z])([А-ЯЁ][а-яё])", r"\1\n\n\2", text)
-    # Restore paragraph-ish spacing after sentence ends where source text was glued together.
-    text = re.sub(r"(?<=[.!?])(?=[А-ЯA-ZЁ])", "\n\n", text)
-    text = re.sub(r"(?<=[.!?])\s+(?=[А-ЯA-ZЁ])", "\n\n", text)
-    return text[:6000]
-
-
-def enrich_description(data):
-    desc = clean_description_text(data.get("description", ""))
-    features = data.get("features", {}) or {}
-    facts = []
-    if data.get("address"):
-        facts.append(f"Локация: {data['address']}.")
-    if data.get("price"):
-        facts.append(f"Цена: {data['price']:,} €".replace(",", " ") + ".")
-    compact = []
-    if features.get("area"): compact.append(f"{features['area']} м²")
-    if features.get("rooms"): compact.append(f"{features['rooms']} спален")
-    if features.get("bathrooms"): compact.append(f"{features['bathrooms']} ванных")
-    if features.get("floor"): compact.append(f"этаж {features['floor']}")
-    if compact:
-        facts.append("Основные параметры: " + ", ".join(compact) + ".")
-    amenities = [AMENITY_MAP[k] for k, v in features.items() if v and k in AMENITY_MAP]
-    if amenities:
-        facts.append("Преимущества: " + ", ".join(dict.fromkeys(amenities)) + ".")
-    parts = []
-    if desc:
-        parts.append(desc)
-    if facts:
-        parts.append("\n".join(facts))
-    return "\n\n".join(parts).strip()[:6000]
-
-
-def normalize_extracted_data(data):
-    """Python-side cleanup/backfill for fields the browser JS may miss."""
-    data = data or {}
-    data["url"] = normalize_idealista_url(data.get("url"))
-    data["idealista_id"] = data.get("idealista_id") or extract_idealista_id(data.get("url"))
-    features = data.setdefault("features", {})
-    text = " ".join(str(data.get(k) or "") for k in ["title", "address", "description"])
-    low = text.lower()
-
-    if not features.get("area"):
-        m = re.search(r"(\d{2,4})\s*(?:m²|m2|м²|м2)", text, re.I)
-        if m:
-            features["area"] = int(m.group(1))
-    if not features.get("rooms"):
-        m = re.search(r"(\d+)\s*(?:спален|спальни|комн|hab|dorm)", text, re.I)
-        if m:
-            features["rooms"] = int(m.group(1))
-    if not features.get("bathrooms"):
-        m = re.search(r"(\d+)\s*(?:ванн|сан\s*узл|bañ|ban|bath)", text, re.I)
-        if m:
-            features["bathrooms"] = int(m.group(1))
-    if not features.get("floor"):
-        m = re.search(r"(?:этаж\s*(\d+)|(\d+)\s*этаж|седьм\w*\s+.*?этаже)", text, re.I)
-        if m:
-            features["floor"] = int(m.group(1) or m.group(2) or 7)
-    if not data.get("tipo"):
-        if any(w in low for w in ["квартира", "piso", "apartamento", "ático", "atico"]):
-            data["tipo"] = "Piso"
-        elif any(w in low for w in ["таунхаус", "adosado", "pareado"]):
-            data["tipo"] = "Таунхаус"
-        elif any(w in low for w in ["дом", "villa", "chalet", "casa"]):
-            data["tipo"] = "Single-Family Home"
-    data["description"] = enrich_description(data)
-    return data
-
-
 # --- JavaScript extractor for Idealista property page ---
 EXTRACTOR_JS = r"""
 (function() {
   const data = {};
-  data.url = location.href;
-  const idMatch = location.pathname.match(/\/inmueble\/(\d+)\//);
-  data.idealista_id = idMatch ? parseInt(idMatch[1], 10) : null;
 
-  const text = (el) => el ? (el.textContent || '').replace(/\s+/g, ' ').trim() : '';
-  const bodyText = document.body.innerText || '';
-  const bodyLower = bodyText.toLowerCase();
-
+  // 1. Title
   const h1 = document.querySelector('h1.main-info__title-main, h1[class*="title-main"], h1');
-  data.title = text(h1) || document.title.split('|')[0].trim();
+  data.title = h1 ? h1.textContent.trim() : document.title.split('|')[0].trim();
 
-  const addrEl = document.querySelector('.main-info__title-minor, [class*="title-minor"], [class*="subtitle"], span[class*="location"]');
-  data.address = text(addrEl);
+  // 2. Address
+  const addrEl = document.querySelector('.main-info__title-minor, [class*="subtitle"], span[class*="location"]');
+  data.address = addrEl ? addrEl.textContent.trim() : '';
 
-  const priceEl = document.querySelector('.info-data-price span, [class*="price-container"] span, h3[class*="price"] span, .price');
-  if (priceEl) data.price = parseInt(text(priceEl).replace(/[^\d]/g, '')) || 0;
+  // 3. Price
+  const priceEl = document.querySelector('.info-data-price span, [class*="price-container"] span, h3[class*="price"] span');
+  if (priceEl) {
+    data.price = parseInt(priceEl.textContent.replace(/[^\d]/g, '')) || 0;
+  }
+  // Fallback: meta og:price
   if (!data.price) {
-    const og = document.querySelector('meta[property="og:description"], meta[name="description"]');
-    const content = og ? og.content : bodyText;
-    const m = content.match(/([\d.\s]{3,})\s*€/);
-    if (m) data.price = parseInt(m[1].replace(/[^\d]/g, '')) || 0;
+    const og = document.querySelector('meta[property="og:description"]');
+    if (og) {
+      const m = og.content.match(/\b([\d.]+)\s*€/);
+      if (m) data.price = parseInt(m[1].replace(/\./g, ''));
+    }
   }
 
+  // 4. Features (area, rooms, bathrooms, floor, terrace, pool, garage)
   data.features = {};
-  const scanFeature = (raw) => {
-    const t = (raw || '').replace(/\s+/g, ' ').trim();
-    const low = t.toLowerCase();
+  document.querySelectorAll('.info-features span, li[class*="feature"]').forEach(el => {
+    const t = el.textContent.trim();
     let m;
-    if ((m = t.match(/([\d.,]+)\s*m²/i))) data.features.area = parseInt(m[1].replace(/[^\d]/g, '')) || data.features.area;
-    if ((m = t.match(/(\d+)\s*(?:hab|dorm|bedroom|спаль|комн)/i))) data.features.rooms = parseInt(m[1], 10) || data.features.rooms;
-    if ((m = t.match(/(\d+)\s*(?:bañ|ban|bath|ванн|сан узл)/i))) data.features.bathrooms = parseInt(m[1], 10) || data.features.bathrooms;
-    if ((m = low.match(/(?:planta|этаж)\s*(\d+)|(\d+)\s*этаж/i))) data.features.floor = parseInt(m[1] || m[2], 10) || data.features.floor;
-    if (/terraza|balc[oó]n|террас|балкон/.test(low)) data.features.terrace = true;
-    if (/piscina|pool|бассейн/.test(low)) data.features.pool = true;
-    if (/piscina privada|private pool/.test(low)) data.features.private_pool = true;
-    if (/garaje|garage|гараж/.test(low)) data.features.garage = true;
-    if (/parking|aparcamiento|парков/.test(low)) data.features.parking = true;
-    if (/ascensor|лифт/.test(low)) data.features.elevator = true;
-    if (/aire acondicionado|air conditioning|кондиционер/.test(low)) data.features.ac = true;
-    if (/calefacci[oó]n|heating|отоплен/.test(low)) data.features.heating = true;
-    if (/jard[ií]n|garden|сад/.test(low)) data.features.garden = true;
-    if (/chimenea|fireplace|камин/.test(low)) data.features.fireplace = true;
-    if (/gimnasio|gym|тренаж/.test(low)) data.features.gym = true;
-    if (/barbacoa|bbq/.test(low)) data.features.bbq = true;
-    if (/vistas al mar|sea view|ocean view|вид на море|вид на океан/.test(low)) data.features.ocean_view = true;
-  };
-  document.querySelectorAll('.info-features span, .info-features li, li[class*="feature"], .details-property li, [class*="details"] li').forEach(el => scanFeature(text(el)));
-  scanFeature(bodyText.slice(0, 5000));
+    if ((m = t.match(/^([\d,]+)\s*m²/))) data.features.area = parseInt(m[1].replace(',', ''));
+    else if ((m = t.match(/^(\d+)\s+hab/i))) data.features.rooms = parseInt(m[1]);
+    else if ((m = t.match(/^(\d+)\s+ba[ñn]/i))) data.features.bathrooms = parseInt(m[1]);
+    else if ((m = t.match(/planta\s+(.+)/i))) data.features.floor = m[1].trim();
+  });
+  // Extended details
+  document.querySelectorAll('.details-property-h3 ~ ul li, .details-property li, [class*="details"] li').forEach(li => {
+    const t = li.textContent.trim();
+    if (t.includes('Terraza')) data.features.terrace = true;
+    if (t.includes('Piscina')) data.features.pool = true;
+    if (t.includes('Garaje') || t.includes('Parking')) data.features.garage = true;
+    if (t.includes('Ascensor')) data.features.elevator = true;
+    if (t.includes('Aire acondicionado')) data.features.ac = true;
+    if (t.includes('Calefacción') || t.includes('Calefaccion')) data.features.heating = true;
+  });
 
-  let descEl = document.querySelector('.adCommentsLanguage, #descriptionContainer, [class*="description-container"], .comment, [data-testid*="description"]');
-  data.description = text(descEl);
+  // 5. Description
+  const descEl = document.querySelector('.adCommentsLanguage, #descriptionContainer, [class*="description-container"]');
+  data.description = descEl ? descEl.textContent.trim().substring(0, 3000) : '';
 
-  const classifyType = () => {
-    if (/\b(adosado|pareado|townhouse)\b/.test(bodyLower)) return 'Таунхаус';
-    if (/\b(chalet|villa)\b/.test(bodyLower)) return 'Single-Family Home';
-    if (/\b(casa)\b/.test(bodyLower)) return 'Single-Family Home';
-    if (/\b(piso|apartamento|ático|atico|estudio)\b/.test(bodyLower)) return 'Piso';
-    return '';
-  };
-  data.tipo = classifyType();
-
-  if (/a reformar|para reformar|necesita reforma/.test(bodyLower)) data.condition = 'Needs Renovation';
-  else if (/obra nueva|primera ocupaci[oó]n|nuevo|a estrenar/.test(bodyLower)) data.condition = 'New';
-  else if (/reformad|buen estado|excelente estado|готова к заселению/.test(bodyLower)) data.condition = 'Good';
-
-  const coordM = document.body.innerHTML.match(/"latitude"\s*:\s*([\d.]+)\s*,\s*"longitude"\s*:\s*([\d.-]+)/);
-  if (coordM) data.coords = `${coordM[1]},${coordM[2]}`;
-
-  const agencyEl = document.querySelector('.advertiser-name, [class*="advertiser"] a, .logo-container span, [class*="professional-name"]');
-  data.agency = text(agencyEl);
-
-  const yearM = bodyText.match(/(?:construido en|año de construcci[oó]n|built in|год постройки|построено в)[:\s]+(\d{4})/i);
-  if (yearM) data.year_built = parseInt(yearM[1], 10);
-
+  // 6. Photos — collect up to 15 unique high-res URLs
   const photos = [];
   const seen = new Set();
-  const bad = /(logo|avatar|icon|sprite|energy|certificate|certificado|eficiencia|static|branding|placeholder|blank|transparent)/i;
-  const addPhoto = (src, w, h) => {
-    if (!src) return;
-    src = src.split('?')[0].replace(/\.webp$/i, '.jpg');
-    if (!/idealista\.com\/blur\//.test(src) && !/id\.pro\.es\.image\.master/.test(src)) return;
-    if (bad.test(src)) return;
+  const addPhoto = (src) => {
+    if (!src || seen.has(src) || photos.length >= 15) return;
+    // Upgrade to high-res format
     src = src.replace(/\/blur\/[^/]+\//, '/blur/WEB_DETAIL_TOP-L-L/');
-    if (seen.has(src)) return;
-    if (w && h && (w < 250 || h < 180)) return;
-    seen.add(src);
-    photos.push(src);
+    src = src.split('?')[0];  // remove query params
+    if (src.includes('idealista.com')) {
+      seen.add(src);
+      photos.push(src);
+    }
   };
-  const mainArea = document.querySelector('[class*="gallery"], [class*="multimedia"], main') || document;
-  mainArea.querySelectorAll('img').forEach(img => addPhoto(img.currentSrc || img.src || img.dataset.src, img.naturalWidth || img.width, img.naturalHeight || img.height));
-  mainArea.querySelectorAll('source[srcset]').forEach(s => {
+  document.querySelectorAll('img[src*="idealista.com"]').forEach(img => addPhoto(img.src));
+  document.querySelectorAll('img[data-src*="idealista.com"]').forEach(img => addPhoto(img.dataset.src));
+  document.querySelectorAll('source[srcset*="idealista.com"]').forEach(s => {
     s.srcset.split(',').forEach(part => addPhoto(part.trim().split(' ')[0]));
   });
-  const html = document.body.innerHTML;
-  const re = /id\.pro\.es\.image\.master\/([a-zA-Z0-9\/]+)\.(?:jpg|webp)/g;
-  let m;
-  while ((m = re.exec(html)) !== null && photos.length < 40) {
-    addPhoto(`https://img4.idealista.com/blur/WEB_DETAIL_TOP-L-L/0/id.pro.es.image.master/${m[1]}.jpg`, 800, 600);
+  // Try to find photos in JSON data on page
+  const bodyHtml = document.body.innerHTML;
+  const photoMatches = bodyHtml.matchAll(/id\.pro\.es\.image\.master\/([a-zA-Z0-9]+)\.jpg/g);
+  for (const m of photoMatches) {
+    addPhoto(`https://img4.idealista.com/blur/WEB_DETAIL_TOP-L-L/0/id.pro.es.image.master/${m[1]}.jpg`);
   }
-  data.photos = photos.slice(0, 30);
+  data.photos = photos;
+
+  // 7. Property type & condition
+  const bodyText = document.body.innerText.toLowerCase();
+  data.tipo = '';
+  if (/\bpiso\b/.test(bodyText)) data.tipo = 'Piso';
+  else if (/\bchalet\b|\bvilla\b/.test(bodyText)) data.tipo = 'Chalet';
+  else if (/\bcasa\b/.test(bodyText)) data.tipo = 'Casa';
+  else if (/\blocal\b/.test(bodyText)) data.tipo = 'Local';
+  else if (/\bterreno\b|\bsolar\b/.test(bodyText)) data.tipo = 'Solar';
+
+  data.condition = '';
+  if (/a reformar|para reformar|necesita reforma/.test(bodyText)) data.condition = 'Needs Renovation';
+  else if (/obra nueva|primera ocupaci[oó]n|nuevo|a estrenar/.test(bodyText)) data.condition = 'New';
+  else if (/reformad|buen estado|excelente estado/.test(bodyText)) data.condition = 'Good';
+
+  // 8. Coordinates
+  const coordM = document.body.innerHTML.match(/"latitude":([\d.]+),"longitude":([\d.-]+)/);
+  if (coordM) data.coords = `${coordM[1]},${coordM[2]}`;
+
+  // 9. Agency
+  const agencyEl = document.querySelector('.advertiser-name, [class*="advertiser"] a, .logo-container span');
+  data.agency = agencyEl ? agencyEl.textContent.trim() : '';
+
+  // 10. Year built
+  const yearM = document.body.innerText.match(/construido en\s+(\d{4})|año de construcci[oó]n[:\s]+(\d{4})/i);
+  if (yearM) data.year_built = parseInt(yearM[1] || yearM[2]);
+
   return JSON.stringify(data);
 })()
 """
@@ -507,7 +334,7 @@ def extract_property_data_playwright(property_url):
             else:
                 data = {}
             data["url"] = property_url
-            return normalize_extracted_data(data)
+            return data
         finally:
             page.close()
 
@@ -577,25 +404,15 @@ def notion_query_all(filter_body=None):
 
 
 def get_existing_urls():
-    """Get existing Idealista objects by stable ID and normalized URL."""
+    """Get all Idealista URLs already in Notion."""
     pages = notion_query_all()
-    existing = {"ids": {}, "urls": {}}
+    urls = {}
     for page in pages:
-        props = page.get("properties", {})
-        prop_id = props.get("ID", {}).get("number")
-        if prop_id is not None:
-            existing["ids"][int(prop_id)] = page["id"]
-        url = props.get("URL", {}).get("url") or props.get("Map", {}).get("url")
+        url = page["properties"].get("Map", {}).get("url") or \
+              page["properties"].get("URL", {}).get("url")
         if url:
-            existing["urls"][normalize_idealista_url(url)] = page["id"]
-    return existing
-
-
-def is_existing_property(prop, existing):
-    prop_id = prop.get("id") or extract_idealista_id(prop.get("url"))
-    if prop_id is not None and int(prop_id) in existing.get("ids", {}):
-        return True
-    return normalize_idealista_url(prop.get("url")) in existing.get("urls", {})
+            urls[url] = page["id"]
+    return urls
 
 
 def get_empty_pages(limit=50):
@@ -606,7 +423,7 @@ def get_empty_pages(limit=50):
         props = page["properties"]
         price = props.get("Price", {}).get("number")
         area = props.get("Area (m²)", {}).get("number")
-        url = props.get("URL", {}).get("url") or props.get("Map", {}).get("url")
+        url = props.get("Map", {}).get("url") or props.get("URL", {}).get("url")
         
         if url and (price is None or area is None):
             empty.append({"notion_id": page["id"], "url": url, "has_price": price is not None, "has_area": area is not None})
@@ -624,20 +441,10 @@ def build_notion_properties(data):
     if title:
         props["Name"] = {"title": [{"text": {"content": title[:200]}}]}
 
-    # Stable Idealista ID + source URL. Map is intentionally NOT used for Idealista URLs.
-    prop_id = data.get("idealista_id") or extract_idealista_id(data.get("url"))
-    if prop_id:
-        props["ID"] = {"number": int(prop_id)}
-
-    url = normalize_idealista_url(data.get("url"))
+    # URL
+    url = data.get("url")
     if url:
-        props["URL"] = {"url": url}
-    props["Map"] = {"url": None}
-
-    props["Email"] = {"email": CONTACT_EMAIL}
-    props["Phone"] = {"phone_number": CONTACT_PHONE}
-    props["Комиссия"] = {"number": DEFAULT_COMMISSION}
-    props["Ваш% комиссии"] = {"number": DEFAULT_OUR_COMMISSION}
+        props["Map"] = {"url": url}
 
     # Price
     price = data.get("price") or 0
@@ -664,39 +471,6 @@ def build_notion_properties(data):
     if address:
         props["Address"] = {"rich_text": [{"text": {"content": address[:200]}}]}
 
-    tipo = data.get("tipo") or ""
-    if tipo:
-        props["Type"] = {"select": {"name": TYPE_OPTIONS.get(tipo.lower(), tipo)}}
-
-    year = data.get("year_built")
-    if year:
-        props["Year Built"] = {"number": int(year)}
-
-    floor = features.get("floor")
-    if floor:
-        try:
-            props["Этаж"] = {"number": int(floor)}
-        except Exception:
-            pass
-
-    amenity_names = []
-    for key, name in AMENITY_MAP.items():
-        if features.get(key):
-            amenity_names.append(name)
-    if amenity_names:
-        props["Amenities"] = {"multi_select": [{"name": n} for n in dict.fromkeys(amenity_names)]}
-
-    desc = data.get("description", "").strip()
-    if desc:
-        props["Description"] = {"rich_text": [{"text": {"content": desc[:2000]}}]}
-
-    photos = data.get("photos", [])[:30]
-    if photos:
-        props["Cover"] = {"files": [
-            {"name": f"idealista-{prop_id or 'photo'}-{i+1}.jpg", "type": "external", "external": {"url": u}}
-            for i, u in enumerate(photos)
-        ]}
-
     return props
 
 
@@ -713,21 +487,12 @@ def build_notion_children(data):
             "type": "heading_2",
             "heading_2": {"rich_text": [{"type": "text", "text": {"content": "📷 Фотографии"}}]}
         })
-        selected = photos[:20]
-        columns_count = 4
-        columns = []
-        for c in range(columns_count):
-            col_children = []
-            for photo_url in selected[c::columns_count]:
-                col_children.append({
-                    "object": "block",
-                    "type": "image",
-                    "image": {"type": "external", "external": {"url": photo_url}}
-                })
-            if col_children:
-                columns.append({"object": "block", "type": "column", "column": {"children": col_children}})
-        if columns:
-            children.append({"object": "block", "type": "column_list", "column_list": {"children": columns}})
+        for photo_url in photos[:12]:
+            children.append({
+                "object": "block",
+                "type": "image",
+                "image": {"type": "external", "external": {"url": photo_url}}
+            })
 
     # Description
     desc = data.get("description", "").strip()
@@ -757,6 +522,7 @@ def build_notion_children(data):
     if data.get("year_built"): char_lines.append(f"📅 Год: {data['year_built']}")
     if data.get("condition"): char_lines.append(f"🔧 Состояние: {data['condition']}")
     if data.get("tipo"): char_lines.append(f"🏠 Тип: {data['tipo']}")
+    if data.get("agency"): char_lines.append(f"🏢 Агентство: {data['agency']}")
     if data.get("coords"): char_lines.append(f"📍 Координаты: {data['coords']}")
 
     if char_lines:
@@ -798,35 +564,6 @@ def add_to_notion(data):
         return None
 
 
-def clear_page_children(page_id):
-    """Archive existing child blocks before rebuilding synced content."""
-    cursor = None
-    while True:
-        params = {"page_size": 100}
-        if cursor:
-            params["start_cursor"] = cursor
-        res = requests.get(
-            f"https://api.notion.com/v1/blocks/{page_id}/children",
-            headers=NOTION_HEADERS,
-            params=params,
-            timeout=30,
-        )
-        if res.status_code != 200:
-            print(f"  ⚠ Children list failed: {res.status_code}")
-            return False
-        payload = res.json()
-        for block in payload.get("results", []):
-            requests.patch(
-                f"https://api.notion.com/v1/blocks/{block['id']}",
-                headers=NOTION_HEADERS,
-                json={"archived": True},
-                timeout=30,
-            )
-        if not payload.get("has_more"):
-            return True
-        cursor = payload.get("next_cursor")
-
-
 def update_notion_page(page_id, data):
     """Update existing Notion page with new data."""
     props = build_notion_properties(data)
@@ -843,9 +580,8 @@ def update_notion_page(page_id, data):
         print(f"  ❌ Props update failed: {res.status_code}")
         return False
     
-    # Replace content blocks (photos, description, features), do not append stale/bad data.
+    # Append content blocks (photos, description, features)
     if children:
-        clear_page_children(page_id)
         res2 = requests.patch(
             f"https://api.notion.com/v1/blocks/{page_id}/children",
             headers=NOTION_HEADERS,
@@ -899,8 +635,8 @@ def process_agency(agency_url):
     print(f"[Agency] Syncing: {agency_url}")
     print(f"{'='*60}")
 
-    existing = get_existing_urls()
-    print(f"[Notion] Existing properties: {len(existing.get('ids', {}))} IDs, {len(existing.get('urls', {}))} URLs")
+    existing_urls = get_existing_urls()
+    print(f"[Notion] Existing properties: {len(existing_urls)}")
 
     stats = {"added": 0, "skipped": 0, "errors": 0, "fatal": False, "fatal_reason": ""}
 
@@ -910,7 +646,7 @@ def process_agency(agency_url):
         return {"added": 0, "skipped": 0, "errors": 1, "fatal": True, "fatal_reason": "failed_to_scrape_agency_page"}
 
     prop_urls = agency_data.get("urls", [])
-    new_props = [p for p in prop_urls if not is_existing_property(p, existing)]
+    new_props = [p for p in prop_urls if p["url"] not in existing_urls]
     print(f"  [Agency] New properties to add: {len(new_props)} (skipping {len(prop_urls) - len(new_props)} existing)")
 
     for i, prop in enumerate(new_props, 1):
@@ -925,7 +661,6 @@ def process_agency(agency_url):
         if not data.get("title"):
             data["title"] = f"Propiedad {prop['id']}"
         data["url"] = prop["url"]
-        data = normalize_extracted_data(data)
 
         if add_to_notion(data):
             stats["added"] += 1
@@ -971,22 +706,21 @@ def fill_empty_pages(limit=30):
             continue
         
         prop_tid = res_prop["targetId"]
-        try:
-            time.sleep(random.uniform(4, 7))
-            data = extract_property_data(prop_tid)
-            data["url"] = url
-            data = normalize_extracted_data(data)
-            
-            if data.get("price") or data.get("features", {}).get("area"):
-                if update_notion_page(notion_id, data):
-                    stats["filled"] += 1
-                else:
-                    stats["errors"] += 1
+        time.sleep(random.uniform(4, 7))
+        
+        data = extract_property_data(prop_tid)
+        data["url"] = url
+        
+        if data.get("price") or data.get("features", {}).get("area"):
+            if update_notion_page(notion_id, data):
+                stats["filled"] += 1
             else:
-                print(f"    ⚠ Could not extract data from page (may be deleted)")
                 stats["errors"] += 1
-        finally:
-            call_browser("close", {"targetId": prop_tid})
+        else:
+            print(f"    ⚠ Could not extract data from page (may be deleted)")
+            stats["errors"] += 1
+        
+        call_browser("close", {"targetId": prop_tid})
         time.sleep(random.uniform(5, 12))
     
     print(f"\n📊 Fill-empty done: {stats['filled']} updated, {stats['errors']} errors")
