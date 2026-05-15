@@ -350,7 +350,7 @@ def call_browser(action, params):
         return None
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=45)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=45)
         if result.returncode != 0:
             print(f"  [BrowserCLI] Error: {result.stderr[:200]}")
             return None
@@ -964,29 +964,19 @@ def fill_empty_pages(limit=30):
         
         print(f"\n  [{i}/{len(empty)}] Нет {', '.join(missing)}: {url[:70]}")
         
-        res_prop = call_browser("open", {"targetUrl": url, "profile": "openclaw"})
-        if not res_prop or "targetId" not in res_prop:
-            print("    ⚠ Failed to open page")
-            stats["errors"] += 1
-            continue
+        time.sleep(random.uniform(4, 7))
+        data = extract_property_data_playwright(url)
+        data["url"] = url
+        data = normalize_extracted_data(data)
         
-        prop_tid = res_prop["targetId"]
-        try:
-            time.sleep(random.uniform(4, 7))
-            data = extract_property_data(prop_tid)
-            data["url"] = url
-            data = normalize_extracted_data(data)
-            
-            if data.get("price") or data.get("features", {}).get("area"):
-                if update_notion_page(notion_id, data):
-                    stats["filled"] += 1
-                else:
-                    stats["errors"] += 1
+        if data.get("price") or data.get("features", {}).get("area"):
+            if update_notion_page(notion_id, data):
+                stats["filled"] += 1
             else:
-                print(f"    ⚠ Could not extract data from page (may be deleted)")
                 stats["errors"] += 1
-        finally:
-            call_browser("close", {"targetId": prop_tid})
+        else:
+            print(f"    ⚠ Could not extract data from page (may be deleted)")
+            stats["errors"] += 1
         time.sleep(random.uniform(5, 12))
     
     print(f"\n📊 Fill-empty done: {stats['filled']} updated, {stats['errors']} errors")
